@@ -34,14 +34,11 @@ def apply_datetime_features(dataframe, variable_name="Date"):
 if __name__ == "__main__":
     # Load environment variables
     load_dotenv()
-    IMP_DATASET = os.getenv("IMP_DATASET")
-    OUTPUT_DIR = os.getenv("OUTPUT_DIR")
+    RESAMPLED_DATASET_DIR = os.getenv("RESAMPLED_DATASET")
+    OUTPUT_DIR = os.getenv("OUTPUT_DIR_v2")
 
     # Load the dataset
-    dataset = pd.read_csv(IMP_DATASET)
-
-    # Drop unnecessary columns
-    dataset.drop(columns=["Unnamed: 0"], inplace=True)
+    dataset = pd.read_csv(RESAMPLED_DATASET_DIR)
 
     print("Initial dataset shape:", dataset.shape)
     print("Initial dataset columns:", dataset.columns)
@@ -68,10 +65,10 @@ if __name__ == "__main__":
     print(f"X has any NaNs: {has_nans}")
 
     print(X, type(X))
-
+ 
     # --- Feature Elimination ---
     # initialize linear regresion estimator
-    rfr_model = RandomForestRegressor(n_estimators=50, 
+    rfr_model = RandomForestRegressor(n_estimators=100, 
                                       criterion='squared_error', 
                                       max_features='sqrt', 
                                       )

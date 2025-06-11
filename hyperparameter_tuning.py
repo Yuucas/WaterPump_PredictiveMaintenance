@@ -14,14 +14,15 @@ from darts import TimeSeries
 from darts.dataprocessing.transformers import Scaler
 from darts.models import TSMixerModel
 from darts.utils.likelihood_models import QuantileRegression
+from darts.dataprocessing.transformers import MissingValuesFiller
+
 
 # Data processing
-from sklearn.preprocessing import MaxAbsScaler, MinMaxScaler, StandardScaler
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import OneHotEncoder
 
 # Model evaluation
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import f1_score, classification_report, roc_auc_score
 
 # Hyperparameter tuning
 import optuna
@@ -54,9 +55,9 @@ test_past_covariates_scaled = None # Covariates for the test_target_ts (Optuna e
 def objective(trial: optuna.trial.Trial) -> float:
 
     # Hyperparameters to tune for TSMixerModel
-    in_len = trial.suggest_int("in_len", 360, 600)
-    out_len = 120  
-    hidden_size = trial.suggest_int("hidden_size", 32, 256, step=8)
+    in_len = trial.suggest_int("in_len", 1152, 4352, step=64)
+    out_len = 576  
+    hidden_size = trial.suggest_int("hidden_size", 32, 256, step=16)
     ff_size = trial.suggest_int("ff_size", 64, 256, step=16) # Feed-forward layer size
     num_blocks = trial.suggest_int("num_blocks", 1, 4)    # Number of TSMixer blocks
     dropout = trial.suggest_float("dropout", 0.05, 0.3)
@@ -70,9 +71,9 @@ def objective(trial: optuna.trial.Trial) -> float:
        len(test_target_ts) < out_len : # Ensure test set is also long enough
         print(f"Trial {trial.number} pruned: Data length insufficient.")
         raise optuna.exceptions.TrialPruned()
+    
 
     # Callbacks for PyTorch Lightning
-    # Monitor "val_loss" which Darts models compute on their validation set
     pruner = PyTorchLightningPruningCallback(trial, monitor="val_loss")
     early_stopper = PLEarlyStopping("val_loss", min_delta=0.001, patience=20, verbose=False) # Reduced patience
     callbacks = [pruner, early_stopper]
@@ -94,7 +95,7 @@ def objective(trial: optuna.trial.Trial) -> float:
         num_blocks=num_blocks,
         batch_size=batch_size,
         activation=activation,
-        n_epochs=300, # Max epochs; early stopping will manage the actual number
+        n_epochs=15, # Max epochs; early stopping will manage the actual number
         nr_epochs_val_period=1, # How often to check validation loss
         dropout=dropout,
         optimizer_kwargs={"lr": lr},
@@ -111,56 +112,59 @@ def objective(trial: optuna.trial.Trial) -> float:
         model.fit(
             series=train_target_ts,
             val_series=val_target_ts, # Darts uses this for early stopping and val_loss
-            past_covariates=train_past_covariates,
-            val_past_covariates=val_past_covariates, # Covariates for the validation set
-            verbose=False
+            past_covariates=train_past_covariates_scaled,
+            val_past_covariates=val_past_covariates_scaled, # Covariates for the validation set
+            verbose=True
         )
 
-        probabilistic_preds_val = model.predict(
-            n=len(test_target_ts),
+        preds_ts = model.predict(
+            n=out_len,
             series=eval_target_ts, # History of target to condition on
-            past_covariates=eval_past_covariates_scaled  # Covariates for the validation period
+            past_covariates=eval_covariates_scaled,  # Covariates for the validation period
+            num_samples=100,  # Number of samples for quantile regression
         )
 
-        # Extract median for point forecast since QuantileRegression is used
-        preds_val_median = probabilistic_preds_val.quantile_timeseries(quantile=0.5)
 
-        actual_target_vals = test_target_ts.values(copy=True).flatten()
-        pred_continuous_val = preds_val_median.values(copy=True).flatten()
+        # Get the median TimeSeries using the correct method name
+        median_pred_ts = preds_ts.quantile_timeseries(quantile=0.5)
 
+        # Extract the numpy array from that TimeSeries
+        pred_scores_per_class = median_pred_ts.values()
+
+        # Get the predicted class labels (this logic was already correct)
+        predicted_class_labels = np.argmax(pred_scores_per_class, axis=1).flatten()
+
+        # Get actual labels from the validation set
+        actual_target_matrix_eval = test_target_ts.values(copy=True)
+        actual_class_labels_eval = np.argmax(actual_target_matrix_eval, axis=1).flatten()
+
+        # Check lengths before scoring
+        if len(actual_class_labels_eval) != len(predicted_class_labels):
+            print(f"FATAL: Mismatch in prediction/actual lengths. Actual: {len(actual_class_labels_eval)}, Pred: {len(predicted_class_labels)}")
+        
         # Ensure lengths match for evaluation
-        min_eval_len = min(len(actual_target_vals), len(pred_continuous_val))
+        min_eval_len = min(len(actual_class_labels_eval), len(predicted_class_labels))
 
-        if min_eval_len < 1:
+        if min_eval_len < 1: # Need at least one point to evaluate
             print(f"Warning: Prediction length ({min_eval_len}) on validation set is too short for trial {trial.number}.")
-            return float('inf') 
 
-        actual_vals_eval = actual_target_vals[:min_eval_len]
-        pred_continuous_eval = pred_continuous_val[:min_eval_len]
+        actual_class_labels_eval = actual_class_labels_eval[:min_eval_len]
+        predicted_class_labels = predicted_class_labels[:min_eval_len]
 
-        print("actual_vals_eval:", actual_vals_eval[:5])
-        print("len(actual_vals_eval):", len(actual_vals_eval))
-        print("Uniqeu : ", np.unique(actual_vals_eval))
-        print("Length Unique: ", len(np.unique(actual_vals_eval)))
-
-        # Check if validation target has both classes for ROC AUC
-        if len(np.unique(actual_vals_eval)) < 2:
-            print(f"Warning: Trial {trial.number} - ROC AUC cannot be calculated. Validation target has only one class. Returning worst score (1.0).")
-            # This can happen if a small validation set doesn't contain both 0s and 1s
-            return 1.0 # Return a "bad" score for Optuna to minimize
-
-        # Calculate ROC AUC score
-        score = roc_auc_score(actual_vals_eval, pred_continuous_eval)
-        objective_value = 1.0 - score # Optuna minimizes, so we minimize (1 - AUC)
+        # Calculate F1 Score
+        score = f1_score(actual_class_labels_eval, predicted_class_labels, average='weighted', zero_division=0)
+        print(f"Trial {trial.number}: F1 Score = {score:.4f}")
+        
+        objective_value = 1.0 - score # We want to minimize the objective, so we return 1 - F1 score
 
         if np.isnan(objective_value) or np.isinf(objective_value):
-            print(f"Warning: Objective value is NaN/inf for trial {trial.number}. ROC AUC: {score}. Returning inf.")
-            return float('inf') # Should not happen with prior checks
+            print(f"Warning: Objective value is NaN/inf for trial {trial.number}. F1 Score: {score}. Returning inf.")
+            return float('inf')
 
         return objective_value
 
     except optuna.exceptions.TrialPruned:
-        raise # Re-raise for Optuna to handle
+        raise 
     except RuntimeError as e: # Catch PyTorch/CUDA errors
         if "CUDA out of memory" in str(e) or "Address already in use" in str(e):
             print(f"Optuna trial {trial.number} failed with RuntimeError (likely CUDA OOM or port issue): {e}. Pruning.")
@@ -168,7 +172,7 @@ def objective(trial: optuna.trial.Trial) -> float:
         print(f"Optuna trial {trial.number} failed with RuntimeError: {e}")
         return float('inf') 
     except ValueError as e: 
-        print(f"Optuna trial {trial.number} - ValueError: {e}. Returning bad score (1.0).")
+        print(f"Optuna trial {trial.number} - ValueError: {e}. Returning bad core (1.0).")
         return 1.0
     except Exception as e: # Catch any other unexpected errors
         print(f"Optuna trial {trial.number} failed with an unexpected error: {e}")
@@ -184,7 +188,7 @@ def print_callback(study, trial):
 if __name__ == "__main__":
 
     load_dotenv()
-    DATASET = os.getenv("OUTPUT_DIR")
+    DATASET = os.getenv("OUTPUT_DIR_v2")
 
     # load dataset
     dataset = pd.read_csv(DATASET)
@@ -204,22 +208,37 @@ if __name__ == "__main__":
 
     # Convert timestamp and sort
     dataset['timestamp'] = pd.to_datetime(dataset['timestamp'])
-    # dataset.sort_values(by='timestamp', inplace=True)
+    dataset.sort_values(by='timestamp', inplace=True)
 
-    # --- Data Preparation for Fine Tuning ---
+    # Data Preparation for Fine Tuning
     time_column_name = 'timestamp' 
     target_column_name = 'machine_status'
-    covariate_cols = [col for col in dataset.columns if col not in [target_column_name, time_column_name]]
 
-    print(f"\nTarget column: ['{target_column_name}']")
+    ohe = OneHotEncoder(sparse_output=False, categories=[[0, 1, 2]])
+
+    # Fit on the entire dataset to ensure all categories are known
+    encoded_targets = ohe.fit_transform(dataset[[target_column_name]])
+    encoded_df = pd.DataFrame(encoded_targets, columns=ohe.get_feature_names_out([target_column_name]), index=dataset.index)
+
+    # Join back with the original dataframe
+    dataset = dataset.join(encoded_df)
+
+    # Update target and covariate column lists
+    target_cols = ohe.get_feature_names_out([target_column_name]).tolist()
+    covariate_cols = [col for col in dataset.columns if col not in target_cols + [target_column_name, time_column_name]]
+
+    print(f"\nTarget column: ['{target_cols}']")
     print(f"Covariate columns ({len(covariate_cols)}): {covariate_cols[:5]}...")
     print(f"Time column: '{time_column_name}'")
 
-    data_freq = 'min'
+    # Convert DataFrame into Darts TimeSeries format
+    full_target_ts = TimeSeries.from_dataframe(dataset, value_cols=target_cols, time_col=time_column_name, fill_missing_dates=True)
+    full_covariates_ts = TimeSeries.from_dataframe(dataset, value_cols=covariate_cols, time_col=time_column_name, fill_missing_dates=True)
 
-    # --- Convert DataFrame into Darts TimeSeries format ---
-    full_target_ts = TimeSeries.from_dataframe(dataset, value_cols=[target_column_name], time_col=time_column_name, fill_missing_dates=True, freq=data_freq)
-    full_covariates_ts = TimeSeries.from_dataframe(dataset, value_cols=covariate_cols, time_col=time_column_name, fill_missing_dates=True, freq=data_freq)
+    # Fill NaNs that might have been created
+    filler = MissingValuesFiller()
+    full_target_ts = filler.transform(full_target_ts)
+    full_covariates_ts = filler.transform(full_covariates_ts)
 
     # Define split proportions
     train_frac = 0.7  # 70% for training
@@ -231,28 +250,27 @@ if __name__ == "__main__":
     # Assign to global variables for Optuna's objective function
     train_target_ts = full_target_ts[:val_split_point]
     val_target_ts = full_target_ts[val_split_point:test_split_point]
-    eval_target_ts = full_target_ts[:test_split_point]
-    test_target_ts = full_target_ts[test_split_point:] # This is test_target_ts_for_optuna_eval
+    test_target_ts = full_target_ts[test_split_point:]
+    eval_target_ts = train_target_ts.append(val_target_ts)
 
     train_covariates_ts_unscaled = full_covariates_ts[:val_split_point]
     val_covariates_ts_unscaled = full_covariates_ts[val_split_point:test_split_point]
-    eval_covariates_ts_unscaled = full_covariates_ts[:test_split_point]
     test_covariates_ts_unscaled = full_covariates_ts[test_split_point:]
     
-    # --- Scale Covariates ---
+    # Scale Covariates
     covariate_scaler = Scaler(StandardScaler())
-    train_past_covariates = covariate_scaler.fit_transform(train_covariates_ts_unscaled)
-    val_past_covariates = covariate_scaler.transform(val_covariates_ts_unscaled)
-    eval_past_covariates_scaled = covariate_scaler.fit_transform(eval_covariates_ts_unscaled)
-    test_past_covariates_scaled = covariate_scaler.transform(test_covariates_ts_unscaled) 
+
+    train_past_covariates_scaled = covariate_scaler.fit_transform(train_covariates_ts_unscaled)
+    val_past_covariates_scaled = covariate_scaler.transform(val_covariates_ts_unscaled)
+    test_past_covariates_scaled = covariate_scaler.transform(test_covariates_ts_unscaled)
+    eval_covariates_scaled = train_past_covariates_scaled.append(val_past_covariates_scaled)
 
     print(f"\nData split lengths: Train Target={len(train_target_ts)}, Val Target={len(val_target_ts)}, Test Target (for Optuna)={len(test_target_ts)}")
-    if train_past_covariates: print(f"Scaled Train Covariates shape: {train_past_covariates.to_dataframe().shape}")
-    if val_past_covariates: print(f"Scaled Val Covariates shape: {val_past_covariates.to_dataframe().shape}")
+    if train_past_covariates: print(f"Scaled Train Covariates shape: {train_past_covariates_scaled.to_dataframe().shape}")
+    if val_past_covariates: print(f"Scaled Val Covariates shape: {val_past_covariates_scaled.to_dataframe().shape}")
     if test_past_covariates_scaled: print(f"Scaled Test Covariates shape: {test_past_covariates_scaled.to_dataframe().shape}")
 
-
-    # --- Optuna Hyperparameter Tuning ---
+    # Optuna Hyperparameter Tuning
     n_optuna_trials = 50
     print(f"\n--- Starting Optuna Hyperparameter Tuning ({n_optuna_trials} trials) ---")
     study = optuna.create_study(direction="minimize", pruner=optuna.pruners.MedianPruner())
