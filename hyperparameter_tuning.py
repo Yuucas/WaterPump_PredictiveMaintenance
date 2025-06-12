@@ -29,16 +29,15 @@ import optuna
 from optuna.integration import PyTorchLightningPruningCallback
 
 '''
-Best params: {
-'in_len': 493, 
-out_len': 120,
-'hidden_size': 32, 
-'ff_size': 112, 
-'num_blocks': 2, 
-'dropout': 0.24602056233523145, 
-'lr': 1.4216953764344364e-05, 
-'activation': 'GELU', 
-'batch_size': 32}
+Best value: 0.0, 
+Best params: {'in_len': 3200, 
+'hidden_size': 112, 
+'ff_size': 64, 
+'num_blocks': 4, 
+'dropout': 0.2307908071260658, 
+'lr': 0.005283329371057148, 
+'activation': 'LeakyReLU', 
+'batch_size': 16}
 '''
 
 # --- Global variables for Optuna study ---

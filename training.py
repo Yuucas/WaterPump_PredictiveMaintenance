@@ -17,11 +17,13 @@ from darts.dataprocessing.transformers import Scaler
 from darts.metrics import smape, mae, mse
 from darts.models import TSMixerModel
 from darts.utils.likelihood_models import QuantileRegression
+from darts.dataprocessing.transformers import MissingValuesFiller
 
 # Data processing
 from sklearn.preprocessing import MaxAbsScaler, MinMaxScaler, StandardScaler
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import OneHotEncoder
 
 # Visualization
 import matplotlib.pyplot as plt
@@ -62,7 +64,7 @@ if __name__ == "__main__":
     dataset['timestamp'] = pd.to_datetime(dataset['timestamp'])
     dataset.sort_values(by='timestamp', inplace=True)
 
-    # --- Data Preparation for Fine Tuning ---
+    # Data Preparation for Fine Tuning
     time_column_name = 'timestamp' 
     target_column_name = 'machine_status'
 
@@ -79,17 +81,22 @@ if __name__ == "__main__":
     target_cols = ohe.get_feature_names_out([target_column_name]).tolist()
     covariate_cols = [col for col in dataset.columns if col not in target_cols + [target_column_name, time_column_name]]
 
-    print(f"\nTarget column: ['{target_column_name}']")
+    print(f"\nTarget column: ['{target_cols}']")
     print(f"Covariate columns ({len(covariate_cols)}): {covariate_cols[:5]}...")
     print(f"Time column: '{time_column_name}'")
 
-    # --- Convert DataFrame into Darts TimeSeries format ---
+    # Convert DataFrame into Darts TimeSeries format
     full_target_ts = TimeSeries.from_dataframe(dataset, value_cols=target_cols, time_col=time_column_name, fill_missing_dates=True)
     full_covariates_ts = TimeSeries.from_dataframe(dataset, value_cols=covariate_cols, time_col=time_column_name, fill_missing_dates=True)
 
+    # Fill NaNs that might have been created
+    filler = MissingValuesFiller()
+    full_target_ts = filler.transform(full_target_ts)
+    full_covariates_ts = filler.transform(full_covariates_ts)
+
     # Define split proportions
-    train_frac = 0.7  # 70% for training
-    val_frac = 0.15   # 15% for validation
+    train_frac = 0.82  # 84% for training
+    val_frac = 0.09   # 8% for validation
 
     val_split_point = int(len(full_target_ts) * train_frac)
     test_split_point = int(len(full_target_ts) * (train_frac + val_frac)) # End of validation, start of test
@@ -97,42 +104,36 @@ if __name__ == "__main__":
     # Assign to global variables for Optuna's objective function
     train_target_ts = full_target_ts[:val_split_point]
     val_target_ts = full_target_ts[val_split_point:test_split_point]
-    eval_target_ts = full_target_ts[:test_split_point]
-    test_target_ts = full_target_ts[test_split_point:] # This is test_target_ts_for_optuna_eval
+    test_target_ts = full_target_ts[test_split_point:]
+    eval_target_ts = train_target_ts.append(val_target_ts)
 
     train_covariates_ts_unscaled = full_covariates_ts[:val_split_point]
     val_covariates_ts_unscaled = full_covariates_ts[val_split_point:test_split_point]
-    eval_covariates_ts_unscaled = full_covariates_ts[:test_split_point]
     test_covariates_ts_unscaled = full_covariates_ts[test_split_point:]
     
-    # --- Scale Covariates ---
+    # Scale Covariates
     covariate_scaler = Scaler(StandardScaler())
-    train_past_covariates = covariate_scaler.fit_transform(train_covariates_ts_unscaled)
-    val_past_covariates = covariate_scaler.transform(val_covariates_ts_unscaled)
-    eval_past_covariates_scaled = covariate_scaler.transform(eval_covariates_ts_unscaled)
-    test_past_covariates_scaled = covariate_scaler.transform(test_covariates_ts_unscaled) 
+
+    train_past_covariates_scaled = covariate_scaler.fit_transform(train_covariates_ts_unscaled)
+    val_past_covariates_scaled = covariate_scaler.transform(val_covariates_ts_unscaled)
+    test_past_covariates_scaled = covariate_scaler.transform(test_covariates_ts_unscaled)
+    eval_covariates_scaled = train_past_covariates_scaled.append(val_past_covariates_scaled)
 
     print(f"\nData split lengths: Train Target={len(train_target_ts)}, Val Target={len(val_target_ts)}, Test Target (for Optuna)={len(test_target_ts)}")
-    if train_past_covariates: print(f"Scaled Train Covariates shape: {train_past_covariates.to_dataframe().shape}")
-    if val_past_covariates: print(f"Scaled Val Covariates shape: {val_past_covariates.to_dataframe().shape}")
+    if train_past_covariates_scaled: print(f"Scaled Train Covariates shape: {train_past_covariates_scaled.to_dataframe().shape}")
+    if val_past_covariates_scaled: print(f"Scaled Val Covariates shape: {val_past_covariates_scaled.to_dataframe().shape}")
     if test_past_covariates_scaled: print(f"Scaled Test Covariates shape: {test_past_covariates_scaled.to_dataframe().shape}")
-
-    print("\nCovariate scaling complete.")
-    print(f"Shape of scaled train covariates: {train_past_covariates.to_dataframe().shape}")
-    print(f"Shape of scaled val covariates: {val_past_covariates.to_dataframe().shape}")
-    print(f"Shape of scaled eval covariates: {eval_past_covariates_scaled.to_dataframe().shape}")
-    print(f"Shape of scaled test covariates: {test_past_covariates_scaled.to_dataframe().shape}")
 
 
     # Best parameters from Optuna
     best_hyperparams = {
-        'input_chunk_length': 448,
-        'output_chunk_length': 120,
-        'hidden_size': 64,
-        'ff_size': 240,
-        'num_blocks': 2,
-        'dropout': 0.13090900921739655,
-        'optimizer_kwargs': {'lr': 0.00113632768450226},
+        'input_chunk_length': 3200,
+        'output_chunk_length': 576,
+        'hidden_size': 112,
+        'ff_size': 64,
+        'num_blocks': 4,
+        'dropout': 0.2307908071260658,
+        'optimizer_kwargs': {'lr': 0.005283329371057148},
         'activation': 'LeakyReLU'
         # 'MaxPool1d': False 
     }
@@ -151,15 +152,15 @@ if __name__ == "__main__":
 
     # --- Final Model Parameters ---
     final_model_params = {
-        'output_chunk_length': best_hyperparams['output_chunk_length'], # Keep consistent with Optuna's out_len_model_config if applicable
+        'output_chunk_length': best_hyperparams['output_chunk_length'],
         'batch_size': 16,
-        'n_epochs': 300,
+        'n_epochs': 200,
         'nr_epochs_val_period': 1,
         'likelihood': QuantileRegression(),
-        'model_name': f"{model_name}_Final_Trained_Model", # For local checkpoints
-        'work_dir': './darts_models', # Specify a directory for Darts models/checkpoints
+        'model_name': f"{model_name}_Final_Trained_Model", # local checkpoints
+        'work_dir': './darts_models', 
         'force_reset': True,
-        'save_checkpoints': True, # Critical for loading best model based on val_loss
+        'save_checkpoints': True,
         'random_state': 42
     }
 
@@ -195,8 +196,8 @@ if __name__ == "__main__":
         final_model.fit(
             series=train_target_ts,
             val_series=val_target_ts,
-            past_covariates=train_past_covariates,
-            val_past_covariates=val_past_covariates,
+            past_covariates=train_past_covariates_scaled,
+            val_past_covariates=val_past_covariates_scaled,
             verbose=True
         )
         print(f"\n--- Final {model_name} Model Training Complete ---")
@@ -226,31 +227,63 @@ if __name__ == "__main__":
         try:
 
             preds_ts = model_to_predict_with.predict(
-                n=len(test_target_ts),
+                n=best_hyperparams['output_chunk_length'], # Output length
                 series=eval_target_ts, # (train + val target)
-                past_covariates=eval_past_covariates_scaled, # (train + val covariates)
+                past_covariates=eval_covariates_scaled, # (train + val covariates)
+                num_samples=100,
             )
 
-            # Extract median prediction for each class
-            pred_scores_per_class = preds_ts.quantile_timeseries(quantile=0.5)
+            # Get the median TimeSeries using the correct method name
+            median_pred_ts = preds_ts.quantile_timeseries(quantile=0.5)
 
-            # Convert scores to class labels by taking the argmax across classes
+            # Extract the numpy array from that TimeSeries
+            pred_scores_per_class = median_pred_ts.values()
+
+            # Get the predicted class labels (this logic was already correct)
             predicted_class_labels = np.argmax(pred_scores_per_class, axis=1).flatten()
 
-            # Actual labels are from the test set
-            actual_target_matrix_eval = test_target_ts.values(copy=True) # Shape: (out_len, n_classes)
+            # Get actual labels from the validation set
+            actual_target_matrix_eval = test_target_ts.values(copy=True)
             actual_class_labels_eval = np.argmax(actual_target_matrix_eval, axis=1).flatten()
 
-            score = f1_score(actual_class_labels_eval, predicted_class_labels, average='weighted', zero_division=0)
+            # Check lengths before scoring
+            if len(actual_class_labels_eval) != len(predicted_class_labels):
+                print(f"FATAL: Mismatch in prediction/actual lengths. Actual: {len(actual_class_labels_eval)}, Pred: {len(predicted_class_labels)}")
+            
+            # Ensure lengths match for evaluation
+            min_eval_len = min(len(actual_class_labels_eval), len(predicted_class_labels))
+
+            if min_eval_len < 1: # Need at least one point to evaluate
+                print(f"Warning: Prediction length ({min_eval_len}) on validation set is too short.")
+
+            actual_class_labels_eval = actual_class_labels_eval[:min_eval_len]
+            predicted_class_labels = predicted_class_labels[:min_eval_len]
+
+            print(f"\n--- Predicted Results --- \n {predicted_class_labels}")
+            print("-------------------------------------")
+
+            # Calculate F1 Score
+            score_f1 = f1_score(actual_class_labels_eval, predicted_class_labels, average='weighted', zero_division=0)
+            print(f"F1 Score = {score_f1:.4f}")
+
+            accuracy = accuracy_score(actual_class_labels_eval, predicted_class_labels)
+            roc_auc = roc_auc_score(actual_class_labels_eval, predicted_class_labels, multi_class='ovr', average='weighted') if len(np.unique(actual_class_labels_eval)) > 1 else 0.5
 
             wandb_logger.experiment.log({
                 "test_accuracy": accuracy,
                 "test_roc_auc": roc_auc,
-                "threshold": threshold
+                "test_f1_score": score_f1
             })
-            report = classification_report(actual_labels_eval, predicted_labels_eval, 
+
+            label_map = {
+                0: 'BROKEN',
+                1: 'NORMAL',
+                2: 'RECOVERING'
+            }
+
+            report = classification_report(actual_class_labels_eval, predicted_class_labels, 
                                             zero_division=0, output_dict=True, labels=[0, 1, 2], 
-                                            target_names=["NORMAL", "RECOVERING", "BROKEN"])
+                                            target_names=["BROKEN", "NORMAL", "RECOVERING"])
             
             print("\n--- Classification Report ---")
             print(report)
@@ -309,33 +342,61 @@ if __name__ == "__main__":
 
             wandb_logger.experiment.log(metrics_to_log)
 
-            cm = confusion_matrix(actual_labels_eval, predicted_labels_eval)
-            fig_cm, ax_cm = plt.subplots(figsize=(6, 5))
-            disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=[0, 1])
+            # Get the *full set* of possible labels from the encoder
+            all_possible_labels = ohe.categories_[0] 
+            # See which labels the model actually predicted
+            unique_predicted_labels = np.unique(predicted_class_labels)
+            target_names = ['BROKEN', 'NORMAL', 'RECOVERING']
+            print(f"\nUnique labels predicted by the model: {unique_predicted_labels}")
+            print(f"All possible labels are: {all_possible_labels}")
+
+            # --------------------------------------------------
+
+            cm = confusion_matrix(actual_class_labels_eval, predicted_class_labels, labels=all_possible_labels)
+            fig_cm, ax_cm = plt.subplots(figsize=(8, 8))
+            disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=target_names)
             disp.plot(ax=ax_cm, cmap=plt.cm.Blues, values_format='d')
+            ax_cm.grid(False)
             ax_cm.set_title(f'Final {model_name} Model - Confusion Matrix')
             wandb_logger.experiment.log({"confusion_matrix": wandb.Image(fig_cm)})
             plt.close(fig_cm)
 
+            # --------------------------------------------------
             # Plotting the actual vs predicted values
-            x_min_display, x_max_display = 9500, 9600
+            x_min_display, x_max_display = 0, len(predicted_class_labels)-1
             fig_preds, ax_preds = plt.subplots(figsize=(15, 7))
 
+            # Get your full data arrays
             time_index_full_test = test_target_ts.time_index
-            actual_labels_np = np.array(actual_labels_eval)
-            predicted_labels_np = np.array(predicted_labels_eval)
-            time_index_np = time_index_full_test[:min_len].to_numpy()
-            display_mask = (time_index_np >= x_min_display) & (time_index_np <= x_max_display)
-            time_index_display, actual_labels_display, predicted_labels_display = time_index_np[display_mask], actual_labels_np[display_mask], predicted_labels_np[display_mask]
+            actual_labels_np = np.array(actual_class_labels_eval) # Assuming true_labels from previous steps
+            predicted_labels_np = np.array(predicted_class_labels) # Assuming pred_labels from previous steps
+
+
+            # Use direct integer slicing to get the display data
+            time_index_display = time_index_full_test[x_min_display:x_max_display]
+            actual_labels_display = actual_labels_np[x_min_display:x_max_display]
+            predicted_labels_display = predicted_labels_np[x_min_display:x_max_display]
+
             if len(time_index_display) > 0:
-                ax_preds.plot(time_index_display, actual_labels_display, label='Actual Failures', marker='o', linestyle='-', color='blue', alpha=0.7, markersize=8)
-                ax_preds.plot(time_index_display, predicted_labels_display, label='Predicted Failures', marker='x', linestyle='--', color='red', alpha=0.7, markersize=8)
-                ax_preds.set_title(f'Final {model_name}: Actual vs. Predicted (Index {x_min_display}-{x_max_display})')
-                ax_preds.set_xlabel('Time Step / Index'); ax_preds.set_ylabel('Failure (1) / No Failure (0)'); ax_preds.set_yticks([0, 1])
-                ax_preds.set_xlim(x_min_display -1, x_max_display +1); ax_preds.legend(); ax_preds.grid(False, which='both', linestyle='--', linewidth=0.5)
+                ax_preds.plot(time_index_display, actual_labels_display, label='Actual Status', marker='o', linestyle='-', color='blue', alpha=0.6, markersize=6)
+                ax_preds.plot(time_index_display, predicted_labels_display, label='Predicted Status', marker='x', linestyle='--', color='red', alpha=0.6, markersize=4)
+                
+                # Update title and labels for clarity
+                ax_preds.set_title(f'Final Model: Actual vs. Predicted (Points {x_min_display} to {x_max_display})')
+                ax_preds.set_xlabel('Timestamp')
+                ax_preds.set_ylabel('Status (0:BROKEN, 1:NORMAL, 2:RECOVERING)')
+                ax_preds.set_yticks([0, 1, 2]) # Show all possible status levels
+                
+                ax_preds.legend()
+                ax_preds.grid(True, which='both', linestyle='--', linewidth=0.5)
                 plt.tight_layout()
-                wandb_logger.experiment.log({"actual_vs_predicted_zoom": wandb.Image(fig_preds)})
-                plt.close(fig_preds)
+                
+                # log the figure
+                wandb_logger.experiment.log({"actual_vs_predicted_plot": wandb.Image(fig_preds)})
+
+                plt.close(fig_preds) # Close the figure to free up memory
+
+            # --------------------------------------------------
 
             else: print("Not enough data for evaluation.")
             
