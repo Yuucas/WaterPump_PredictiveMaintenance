@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import traceback
 from dotenv import load_dotenv
+import joblib
 
 # Preprocessing
 from feature_engine.selection import RecursiveFeatureElimination
@@ -119,6 +120,8 @@ if __name__ == "__main__":
     test_past_covariates_scaled = covariate_scaler.transform(test_covariates_ts_unscaled)
     eval_covariates_scaled = train_past_covariates_scaled.append(val_past_covariates_scaled)
 
+    joblib.dump(covariate_scaler, "darts_models/TSMixer_Final_Trained_Model/pump_covariate_scaler.pkl")
+
     print(f"\nData split lengths: Train Target={len(train_target_ts)}, Val Target={len(val_target_ts)}, Test Target (for Optuna)={len(test_target_ts)}")
     if train_past_covariates_scaled: print(f"Scaled Train Covariates shape: {train_past_covariates_scaled.to_dataframe().shape}")
     if val_past_covariates_scaled: print(f"Scaled Val Covariates shape: {val_past_covariates_scaled.to_dataframe().shape}")
@@ -181,6 +184,7 @@ if __name__ == "__main__":
         "enable_progress_bar": True,
         "logger": wandb_logger # Integrate WandbLogger
     }
+
     final_model_params['pl_trainer_kwargs'] = final_pl_trainer_kwargs
 
     # Create and train the final model

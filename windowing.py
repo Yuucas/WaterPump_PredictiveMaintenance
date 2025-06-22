@@ -40,7 +40,7 @@ if __name__ == "__main__":
             if not modes.empty:
                 return modes[0] # Return the first mode if multiple exist
             else:
-                return np.nan # Or some other default if the series was empty/all NaN
+                return 0 # Or some other default if the series was empty/all NaN
 
     # --- Define Aggregation Logic ---
     agg_functions = {}
@@ -56,9 +56,15 @@ if __name__ == "__main__":
     dataset_5min_freq = dataset.resample('5min').agg(agg_functions)
     print(dataset_5min_freq.head(10))
 
-    status_counts = dataset_5min_freq['machine_status'].value_counts()
+    # dataset_5min_freq = dataset_5min_freq.fillna(method='ffill').fillna(method='bfill')
+    # print("Filling NaNs created during resampling...")
+    df_resampled = dataset_5min_freq.fillna(method='ffill')
+    # Add a backfill just in case there are NaNs at the very beginning
+    df_resampled_v2 = df_resampled.fillna(method='bfill')
+
+    status_counts = df_resampled_v2['machine_status'].value_counts()
     print("Counts of each unique string in 'machine_status':")
     print("5Min: ", status_counts)
 
     # saving the dataframe
-    dataset_5min_freq.to_csv(RESAMPLED_DATASET_DIR)
+    df_resampled_v2.to_csv(RESAMPLED_DATASET_DIR)
